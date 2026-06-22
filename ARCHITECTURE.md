@@ -189,20 +189,24 @@ SELECT create_hypertable('trades', 'timestamp');
 
 -- Closed aggregation windows (hypertable)
 CREATE TABLE windows (
-  id              UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
-  symbol          TEXT          NOT NULL,
-  window_size     TEXT          NOT NULL,  -- '1m' | '5m' | '15m'
-  window_start    TIMESTAMPTZ   NOT NULL,
-  window_end      TIMESTAMPTZ   NOT NULL,
-  open_price      NUMERIC(18,8) NOT NULL,
-  close_price     NUMERIC(18,8) NOT NULL,
-  high_price      NUMERIC(18,8) NOT NULL,
-  low_price       NUMERIC(18,8) NOT NULL,
-  avg_price       NUMERIC(18,8) NOT NULL,
-  volume          NUMERIC(18,8) NOT NULL,
-  trade_count     INTEGER       NOT NULL,
-  price_change_pct NUMERIC(8,4) NOT NULL,
-  volume_delta    NUMERIC(18,8) NOT NULL
+  id               UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+  symbol           TEXT          NOT NULL,
+  window_size      TEXT          NOT NULL,  -- '1m' | '5m' | '15m'
+  window_start     TIMESTAMPTZ   NOT NULL,
+  window_end       TIMESTAMPTZ   NOT NULL,
+  open_price       NUMERIC(18,8) NOT NULL,
+  close_price      NUMERIC(18,8) NOT NULL,
+  high_price       NUMERIC(18,8) NOT NULL,
+  low_price        NUMERIC(18,8) NOT NULL,
+  avg_price        NUMERIC(18,8) NOT NULL,
+  volume           NUMERIC(18,8) NOT NULL,
+  trade_count      INTEGER       NOT NULL,
+  price_change_pct NUMERIC(8,4)  NOT NULL,
+  volume_delta     NUMERIC(18,8) NOT NULL,
+  UNIQUE (symbol, window_start, window_end, window_size)
+  -- Uniqueness enforced for two reasons:
+  -- 1. Idempotent inserts (ON CONFLICT DO NOTHING) handle Kafka at-least-once redelivery
+  -- 2. Prevents duplicate rows from corrupting the Detector's Z-score baseline queries
 );
 SELECT create_hypertable('windows', 'window_start');
 
@@ -214,11 +218,29 @@ CREATE TABLE anomalies (
   severity         TEXT        NOT NULL,  -- 'low' | 'medium' | 'high'
   trigger_value    NUMERIC     NOT NULL,
   threshold_value  NUMERIC     NOT NULL,
-  -- ML features (full window context at detection time)
-  price_change_pct NUMERIC(8,4),
-  volume_change_pct NUMERIC(8,4),
-  trade_count      INTEGER,
-  trend_direction  TEXT,
+
+  -- Raw window metrics at detection time
+  price_change_pct      NUMERIC(8,4),   -- open → close % change
+  max_drawdown_pct      NUMERIC(8,4),   -- max intra-window price pullback (high → low / high)
+  price_volatility      NUMERIC(8,4),   -- stddev of trade prices within window
+  volume_change_pct     NUMERIC(8,4),   -- volume vs previous window
+  volume_acceleration   NUMERIC(8,4),   -- rate of volume change (first half vs second half)
+  trade_count           INTEGER,
+  buy_sell_ratio        NUMERIC(8,4),   -- buy volume / total volume (requires side on trades)
+  trend_direction       TEXT,           -- 'up' | 'down' | 'sideways'
+
+  -- Z-scores at detection time (computed values, not recalculated)
+  z_score_volume        NUMERIC(8,4),
+  z_score_price_change  NUMERIC(8,4),
+  z_score_trade_count   NUMERIC(8,4),
+
+  -- Baseline stats at detection time — critical for ML: reconstructs what the model saw
+  -- Without these, you cannot recover the exact baseline that triggered the anomaly
+  baseline_mean_volume        NUMERIC(18,8),
+  baseline_stddev_volume      NUMERIC(18,8),
+  baseline_mean_price_change  NUMERIC(8,4),
+  baseline_stddev_price_change NUMERIC(8,4),
+
   detected_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -233,7 +255,7 @@ CREATE TABLE insights (
 );
 ```
 
-**Idempotent writes:** Storage uses `INSERT ... ON CONFLICT DO NOTHING` on `trades` (by `id + timestamp`) to handle at-least-once Kafka redelivery without duplicates.
+**Idempotent writes:** Storage uses `INSERT ... ON CONFLICT DO NOTHING` on both `trades` (by `id + timestamp`) and `windows` (by `symbol + window_start + window_end + window_size`) to handle at-least-once Kafka redelivery without duplicates. Duplicate window rows would silently corrupt the Detector's Z-score baseline by inflating rolling averages.
 
 ---
 
@@ -434,6 +456,21 @@ interface InsightContent {
 ```
 
 **Async execution:** Insight generation is fully asynchronous. The AI Service consumes from `btc.anomalies`, batches events in memory, fires the API call, and publishes to `btc.insights` — all without blocking any other module. A slow or failing AI call has zero impact on trade ingestion, aggregation, or detection.
+
+**Kafka offset commit during batch window:** While anomalies are buffered in the 30-second window, their Kafka offsets are not yet committed. If the process crashes mid-buffer, Kafka redelivers all buffered anomalies on restart — they are rebuffered and the API call is eventually made. Offsets are committed only after the batch call completes (success or terminal failure). No anomalies are silently dropped due to a crash during buffering.
+
+**AI provider error classification:**
+
+Not all API errors should be handled the same way. The AI Service classifies errors before deciding to retry, skip, or alert:
+
+| HTTP Status | Meaning | Action |
+|---|---|---|
+| `429 Too Many Requests` | Rate limited — temporary | Retry with exponential backoff + jitter; respect `Retry-After` header if present |
+| `500 Internal Server Error` | OpenAI transient failure | Retry up to 3x with exponential backoff + jitter (base 1s, cap 4s) |
+| `503 Service Unavailable` | OpenAI outage | Retry + increment circuit breaker failure counter |
+| `403 Forbidden` | Invalid API key or quota exhausted | Do NOT retry — log as critical alert, skip all subsequent calls until resolved |
+| `400 Bad Request` | Malformed prompt payload | Do NOT retry — log full payload to DLQ for inspection, skip insight |
+| Timeout (> 30s) | Network or provider latency | Retry once; if second attempt also times out, skip and increment circuit breaker counter |
 
 **Token budget:** Each call is estimated at ~300-500 input tokens + ~200 output tokens. At GPT-4o-mini pricing, cost per insight is approximately $0.0001. Even at 1000 insights/day this is ~$0.10/day.
 
@@ -649,11 +686,15 @@ The non-functional requirement states "no events should be lost during normal op
 | Module | Error type | Action |
 |---|---|---|
 | Collector (WebSocket) | Connection drop | Exponential backoff with jitter reconnect (ADR-01) |
-| Collector (Kafka produce) | Broker unavailable | Retry 5x with backoff; if all fail, buffer in memory up to 10k messages, then pause WebSocket |
-| Storage (DB write) | Transient error | Retry 3x with exponential backoff (1s, 2s, 4s); on final failure → DLQ |
+| Collector (Kafka produce) | Broker unavailable | Retry 5x with exponential backoff + jitter; if all fail, buffer in memory up to 10k messages, then pause WebSocket |
+| Storage (DB write) | Transient error | Retry 3x with exponential backoff + jitter (base 1s, cap 4s); on final failure → DLQ |
 | Aggregator | Any processing error | Log + skip trade; window continues with remaining trades |
 | Detector | Any processing error | Log + skip window; do not publish anomaly for that window |
-| AI Service | API error / timeout | Log + skip insight (pipeline not blocked); anomaly already persisted |
+| AI Service | `429` rate limit | Retry with exponential backoff + jitter; respect `Retry-After` header if present |
+| AI Service | `500` / `503` transient | Retry up to 3x with exponential backoff + jitter (base 1s, cap 4s); increment circuit breaker counter |
+| AI Service | `403` forbidden | Do NOT retry — log as critical alert, disable AI calls until API key is resolved |
+| AI Service | `400` bad request | Do NOT retry — send payload to `btc.dlq` for manual inspection |
+| AI Service | Timeout (> 30s) | Retry once; on second timeout skip insight and increment circuit breaker counter |
 | Any consumer | Unhandled exception | Log error, do NOT commit offset → Kafka redelivers the message |
 
 **Dead Letter Queue:** `btc.dlq` topic receives messages that exhausted all retries. Each DLQ message includes:
