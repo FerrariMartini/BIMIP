@@ -1,5 +1,5 @@
 import express, { type Express } from "express";
-import type { HealthResponse } from "../schema";
+import type { HealthResponse } from "../schema/app_health";
 
 export function createApiServer(): Express {
   const app = express();
