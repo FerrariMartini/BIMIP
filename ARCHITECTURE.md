@@ -38,7 +38,7 @@ WebSocket connections can become "zombie connections": TCP stays open but data s
 
 ### Decision
 
-**Exchange:** Binance — `wss://stream.binance.com:9443/ws/btcusdt@trade`
+**Exchange:** Binance — `wss://stream.binance.com:9443/ws` (one stream per symbol: `/{symbol_lowercase}@trade`, e.g. `/btcusdt@trade`, `/ethusdt@trade`)
 
 **Reconnection:** Exponential Backoff with Jitter
 - Base delay: 1s
@@ -66,7 +66,7 @@ WebSocket connections can become "zombie connections": TCP stays open but data s
 ```
 Mapped fields: `t` → tradeId, `p` → price, `q` → quantity, `T` → timestamp, `m` → isBuyerMarketMaker (side)
 
-**Mock / Test Mode:** The collector must support a mock mode that replays pre-recorded trade events from a local file or generates synthetic events at a configurable rate. This enables local development and testing without a live Binance connection. Mock mode is activated via environment variable (`COLLECTOR_MODE=mock`).
+**Mock / Test Mode:** The collector must support a mock mode that replays pre-recorded trade events from a local file or generates synthetic events at a configurable rate for all configured symbols. This enables local development and testing without a live Binance connection. Mock mode is activated via environment variable (`COLLECTOR_MODE=mock`).
 
 ---
 
@@ -86,29 +86,29 @@ This makes Kafka the **source of truth**: the database is a derived, queryable v
 
 **Topics:**
 
-| Topic | Producer | Consumers | Retention |
-|---|---|---|---|
-| `btc.raw-trades` | Collector | Aggregator, Storage | 7 days |
-| `btc.market-windows` | Aggregator | Detector, Storage | 1 day |
-| `btc.anomalies` | Detector | AI Service, Storage | 30 days |
-| `btc.insights` | AI Service | Storage | 30 days |
+| Topic | Producer | Consumers | Partitions | Retention |
+|---|---|---|---|---|
+| `crypto.raw-trades` | Collector | Aggregator, Storage | 6 | 7 days |
+| `crypto.market-windows` | Aggregator | Detector, Storage | 6 | 1 day |
+| `crypto.anomalies` | Detector | AI Service, Storage | 6 | 30 days |
+| `crypto.insights` | AI Service | Storage | 6 | 30 days |
 
-Topic names are prefixed with `btc.` to namespace them and avoid collisions in a shared Kafka cluster.
+Topic names are prefixed with `crypto.` to namespace them within a shared Kafka cluster and remain symbol-agnostic — adding a new symbol requires no infrastructure changes.
 
-**Partitions:** 3 partitions per topic (production-like baseline — enables future horizontal scaling and demonstrates partition assignment concepts, even running with a single consumer in v1).
+**Partitions:** 6 partitions per topic. This allows up to 6 Aggregator instances to run in parallel (one partition per instance), accommodating multiple symbols simultaneously. Adding symbols beyond 6 only requires increasing the partition count — no code changes.
 
 **Replication factor:** 1 (single broker for local development). Production would use 3.
 
 **Consumer groups:**
 
-| Group ID | Module | Topics consumed |
-|---|---|---|
-| `btc.aggregator` | Aggregator | `btc.raw-trades` |
-| `btc.detector` | Detector | `btc.market-windows` |
-| `btc.ai` | AI Service | `btc.anomalies` |
-| `btc.storage` | Storage | `btc.raw-trades`, `btc.market-windows`, `btc.anomalies`, `btc.insights` |
+| Group ID | Module | Topics consumed | Note |
+|---|---|---|---|
+| `crypto.aggregator` | Aggregator | `crypto.raw-trades` | stateless — any instance processes any symbol |
+| `crypto.detector` | Detector | `crypto.market-windows` | stateless — any instance processes any symbol |
+| `crypto.ai` | AI Service | `crypto.anomalies` | buffers per symbol in memory |
+| `crypto.storage` | Storage | `crypto.raw-trades`, `crypto.market-windows`, `crypto.anomalies`, `crypto.insights` | sink only |
 
-Having named consumer groups is critical: `btc.aggregator` and `btc.storage` both consume `btc.raw-trades` independently — each group maintains its own offset, so neither interferes with the other.
+Having named consumer groups is critical: `crypto.aggregator` and `crypto.storage` both consume `crypto.raw-trades` independently — each group maintains its own offset, so neither interferes with the other.
 
 **Serialization:** JSON (UTF-8). Readable, no schema registry required, sufficient for this scale.
 
@@ -117,6 +117,7 @@ Having named consumer groups is critical: `btc.aggregator` and `btc.storage` bot
 acks: 'all'               — wait for all in-sync replicas to acknowledge
 compression: 'snappy'     — reduces network and disk usage
 retries: 5                — retry on transient failures
+key: null                 — no partition key; Kafka distributes messages round-robin
 ```
 
 **Consumer config (production-like):**
@@ -128,9 +129,14 @@ session.timeout.ms: 10000   — heartbeat timeout
 
 **Offset commit strategy:** At-least-once delivery. Offset is committed only after the message is successfully processed (written to DB or forwarded to next topic). Duplicate events on crash are tolerated — Storage uses idempotent writes (upsert by event ID) to handle redelivery safely.
 
-**Dead Letter Queue:** Failed messages after all retries are published to `btc.dlq` with the original topic, payload, and error reason for manual inspection.
+**Dead Letter Queue:** Failed messages after all retries are published to `crypto.dlq` with the original topic, payload, and error reason for manual inspection.
 
-**Partition key:** The Collector must set `key = symbol` (e.g., `"BTCUSDT"`) when producing to `btc.raw-trades`. Kafka routes messages with the same key deterministically to the same partition. This guarantees that all trades for a symbol are processed by the same Aggregator instance in order — which is required for correct window calculation. Without this, multiple instances would each receive a partial subset of trades, producing incomplete and incorrect windows.
+**Partition key:** The Collector produces messages **without a partition key** (`key = null`). Kafka distributes messages round-robin across the 6 partitions, balancing load evenly.
+
+Kafka's responsibility is transport and load distribution — not business-level routing. Symbol grouping for aggregation is the responsibility of the Aggregator via Redis (see ADR-04). This separation means:
+- Any Aggregator instance can process a trade for any symbol.
+- Adding symbols or scaling instances requires no producer changes.
+- Multiple Aggregator instances write partial accumulations to Redis atomically; no instance owns a symbol.
 
 ---
 
@@ -276,50 +282,67 @@ The aggregation service must maintain state for open time windows (e.g., a 1-min
 
 ### Horizontal Scalability Analysis
 
-Stateful windowed aggregation cannot be naively scaled horizontally: if multiple Aggregator instances each receive a subset of trades for the same symbol, they produce partial and incorrect windows.
+Stateful windowed aggregation cannot be naively scaled horizontally when state lives in process memory: if multiple Aggregator instances each receive a subset of trades for the same symbol, they produce partial and incorrect windows.
 
 The correct solutions for horizontal scale are:
-- **Redis shared state** — all instances update shared atomic accumulators (`HINCRBYFLOAT`); any instance can finalize a window when the clock triggers. No DB required on the hot path. This is the natural evolution of in-memory for Node.js.
+- **Redis shared state** — all instances update shared atomic accumulators (`HINCRBYFLOAT`); any instance can finalize a window when the clock triggers. No DB required on the hot path. This is the design adopted from v1.
 - **Two-stage aggregation** — partial aggregators produce partial sums to a merge aggregator (Map-Reduce over streams). Used by Apache Flink and Kafka Streams natively.
 - **DB polling (micro-batch)** — Aggregator queries raw trades from DB, processes in batches, uses row locks. This abandons the streaming model, introduces write-then-read latency, and makes the DB the critical path bottleneck. Not recommended.
 
 ### Decision
 
-**v1: In-memory, single instance**
+**Redis shared state — stateless Aggregator instances**
 
-The Aggregator maintains window state entirely in process memory. At ~150 trades/second for BTCUSDT, a single Node.js instance handles this with negligible CPU usage — arithmetic operations are orders of magnitude faster than the I/O bottlenecks (Kafka, DB writes).
+The Aggregator is stateless at the process level. Window state is stored entirely in Redis, keyed by `(symbol, windowSize, windowStart)`. Any Aggregator instance can process any trade for any symbol. No coordination between instances is required on the hot path — Redis atomic operations provide the necessary isolation.
 
 **Window type:** Tumbling windows (fixed, non-overlapping). Each window closes at a fixed boundary (e.g., :00, :01, :02...) regardless of trade volume.
 
-**Window close trigger:** Wall clock timer. A `setInterval` aligned to the window boundary closes the current accumulator and publishes the closed window to `btc.market-windows`. Event watermarks are not used in v1.
-
-**Crash recovery:** On restart, the in-progress window is lost. The Aggregator resumes from the next window boundary. This is acceptable for v1 — at most one partial window is lost per crash, and the DB retains all previously closed windows.
-
-**In-memory accumulator structure:**
-```typescript
-interface WindowAccumulator {
-  symbol:       string
-  windowSize:   '1m' | '5m' | '15m'
-  windowStart:  number
-  sum:          number
-  count:        number
-  min:          number
-  max:          number
-  firstPrice:   number
-  lastPrice:    number
-  volume:       number
-}
+**Redis accumulator key pattern:**
+```
+Key:    crypto:window:{symbol}:{windowSize}:{windowStart_epoch_ms}
+Type:   HASH
+Fields: sum_price, count, min_price, max_price, volume,
+        first_price, first_ts, last_price, last_ts
+TTL:    windowSize_ms + 10 000 ms  — auto-expire abandons incomplete windows after crash
 ```
 
-**Known limitation:** This design does not scale horizontally for the Aggregator. A second instance consuming the same Kafka partition is not possible without coordination — Kafka's consumer group protocol assigns each partition to exactly one instance, so this limitation is enforced at the infrastructure level in v1.
+Example key: `crypto:window:BTCUSDT:1m:1716000060000`
 
-**v2 evolution path: Redis shared state**
+**Accumulation (hot path — per trade received):**
+```
+HINCRBYFLOAT  key  sum_price  {price}      — atomic float accumulation
+HINCRBYFLOAT  key  volume     {quantity}   — atomic float accumulation
+HINCRBY       key  count      1            — atomic integer accumulation
+```
 
-When horizontal scaling becomes necessary (multiple high-volume symbols, multiple exchanges), the migration path is:
-1. Replace in-memory accumulators with Redis `HINCRBYFLOAT` / `HINCRBY` operations (atomic, no locks needed)
-2. Window finalization uses a Redis `SET NX` lock so exactly one instance publishes the closed window
-3. Any number of Aggregator instances can process trades for any symbol without coordination overhead
-4. No changes required to Detector, Storage, or AI modules — only the Aggregator internals change
+`min_price` and `max_price` have no native atomic min/max in Redis. A short Lua script runs atomically on the Redis server to perform the conditional update without a round-trip:
+```lua
+-- SET minimum atomically
+local cur = redis.call('HGET', KEYS[1], 'min_price')
+if not cur or tonumber(ARGV[1]) < tonumber(cur) then
+  redis.call('HSET', KEYS[1], 'min_price', ARGV[1])
+end
+```
+
+`first_price` / `first_ts` are written with `HSETNX` (set if field not exists) — first writer wins.
+`last_price` / `last_ts` are overwritten unconditionally — last writer wins.
+
+Both fields are best-effort within the at-least-once delivery model; duplicate trades on redelivery may shift first/last by at most one trade, which is acceptable for OHLCV purposes.
+
+**Window close trigger:** Wall-clock `setInterval` aligned to window boundaries, running independently in each Aggregator instance. All instances fire at the same wall-clock time. Exactly one instance must publish the closed window — this is coordinated by a Redis lock.
+
+**Window finalization (SET NX lock):**
+```
+SET  crypto:lock:{symbol}:{windowSize}:{windowStart}  {instance_id}  NX  EX 5
+```
+- `NX` — only sets if the key does not exist (atomic test-and-set).
+- `EX 5` — lock expires in 5 seconds, preventing deadlock if the winning instance crashes before publishing.
+- The instance that wins the lock: reads the accumulator HASH, computes derived fields (avg_price, price_change_pct, volume_delta), publishes the closed window to `crypto.market-windows`, then deletes the accumulator key.
+- Instances that lose the lock: skip silently — the window will be published by the winner.
+
+**Crash recovery:** Window state survives process restarts — it lives in Redis, not in process memory. On restart, an instance rejoins the consumer group and resumes processing. In-progress windows in Redis are unaffected. The TTL ensures that orphaned accumulators (e.g., from a crash that prevented finalization) are automatically expired and do not leak memory.
+
+**Horizontal scaling:** Adding a new Aggregator instance requires only joining the `crypto.aggregator` consumer group. Kafka rebalances partitions automatically. No instance owns a symbol — Redis is the shared state layer. The number of instances can be scaled up to the number of partitions (6) without any code or configuration change.
 
 ---
 
@@ -350,7 +373,7 @@ The detection service needs to compare current market metrics against baselines 
 
 **Redis data structure:**
 ```
-Key:   btc:baseline:{symbol}:{windowSize}    e.g. btc:baseline:BTCUSDT:1m
+Key:   crypto:baseline:{symbol}:{windowSize}    e.g. crypto:baseline:BTCUSDT:1m
 Type:  Sorted Set (ZSET)
 Score: window_start timestamp (epoch ms)
 Value: JSON { volume, price_change_pct, trade_count, avg_price }
@@ -380,7 +403,7 @@ DETECTOR_FALLBACK_HIGH_VOLUME_MULTIPLIER=2.5
 DETECTOR_MIN_SAMPLES=30
 ```
 
-**Multiple anomalies per window:** A single closed window can trigger multiple anomaly types simultaneously. Each detected anomaly is published as a separate event to `btc.anomalies`. All anomalies trigger AI analysis.
+**Multiple anomalies per window:** A single closed window can trigger multiple anomaly types simultaneously. Each detected anomaly is published as a separate event to `crypto.anomalies`. All anomalies trigger AI analysis.
 
 **AI trigger:** All detected anomalies trigger an AI insight, regardless of severity. Severity is computed and stored for future ML use but does not gate the AI call in v1.
 
@@ -415,12 +438,12 @@ t=0s    PriceShock arrives   ──┐
 t=15s   HighVolume arrives   ──┤── buffer per symbol
 t=25s   Momentum arrives     ──┘
 t=30s   timer fires          ──► single OpenAI call with all 3 anomalies as context
-                                  ──► 1 insight published to btc.insights
+                                  ──► 1 insight published to crypto.insights
 ```
 
 If only one anomaly arrives and no others follow within 30s, the call fires immediately at timer expiry with single-anomaly context.
 
-**Unavailability handling:** If the OpenAI API is unavailable or returns an error, the AI Service logs the failure, publishes nothing to `btc.insights`, and does not block the pipeline. The anomaly is already persisted in the `anomalies` table. The missing insight is a known gap, not a pipeline failure.
+**Unavailability handling:** If the OpenAI API is unavailable or returns an error, the AI Service logs the failure, publishes nothing to `crypto.insights`, and does not block the pipeline. The anomaly is already persisted in the `anomalies` table. The missing insight is a known gap, not a pipeline failure.
 
 **Prompt template:**
 
@@ -455,7 +478,7 @@ interface InsightContent {
 }
 ```
 
-**Async execution:** Insight generation is fully asynchronous. The AI Service consumes from `btc.anomalies`, batches events in memory, fires the API call, and publishes to `btc.insights` — all without blocking any other module. A slow or failing AI call has zero impact on trade ingestion, aggregation, or detection.
+**Async execution:** Insight generation is fully asynchronous. The AI Service consumes from `crypto.anomalies`, batches events in memory, fires the API call, and publishes to `crypto.insights` — all without blocking any other module. A slow or failing AI call has zero impact on trade ingestion, aggregation, or detection.
 
 **Kafka offset commit during batch window:** While anomalies are buffered in the 30-second window, their Kafka offsets are not yet committed. If the process crashes mid-buffer, Kafka redelivers all buffered anomalies on restart — they are rebuffered and the API call is eventually made. Offsets are committed only after the batch call completes (success or terminal failure). No anomalies are silently dropped due to a crash during buffering.
 
@@ -553,12 +576,13 @@ The README specifies logs, metrics, and health checks as requirements. The tooli
 
 ### Key Metrics to Expose
 
-- `trades_received_total` — counter
-- `trades_per_second` — gauge
-- `kafka_consumer_lag` — gauge (per topic/partition)
-- `anomalies_detected_total` — counter (labeled by type)
-- `ai_requests_total` — counter (labeled by status: success/error)
-- `window_processing_duration_ms` — histogram
+- `crypto_trades_received_total` — counter (labeled by symbol, exchange)
+- `crypto_trades_per_second` — gauge (labeled by symbol)
+- `crypto_kafka_consumer_lag` — gauge (per topic/partition/group)
+- `crypto_anomalies_detected_total` — counter (labeled by symbol, type)
+- `crypto_ai_requests_total` — counter (labeled by status: success/error/skipped)
+- `crypto_window_processing_duration_ms` — histogram (labeled by window_size)
+- `crypto_redis_window_ops_total` — counter (labeled by op, symbol)
 
 ### Decision
 
@@ -576,15 +600,16 @@ The README specifies logs, metrics, and health checks as requirements. The tooli
 
 | Metric | Type | Labels |
 |---|---|---|
-| `btc_trades_received_total` | Counter | `symbol`, `exchange` |
-| `btc_trades_per_second` | Gauge | `symbol` |
-| `btc_kafka_consumer_lag` | Gauge | `topic`, `partition`, `group` |
-| `btc_windows_closed_total` | Counter | `symbol`, `window_size` |
-| `btc_anomalies_detected_total` | Counter | `symbol`, `type` |
-| `btc_ai_requests_total` | Counter | `status` (success/error/skipped) |
-| `btc_ai_batch_size` | Histogram | — |
-| `btc_window_processing_duration_ms` | Histogram | `window_size` |
-| `btc_websocket_reconnections_total` | Counter | — |
+| `crypto_trades_received_total` | Counter | `symbol`, `exchange` |
+| `crypto_trades_per_second` | Gauge | `symbol` |
+| `crypto_kafka_consumer_lag` | Gauge | `topic`, `partition`, `group` |
+| `crypto_windows_closed_total` | Counter | `symbol`, `window_size` |
+| `crypto_anomalies_detected_total` | Counter | `symbol`, `type` |
+| `crypto_ai_requests_total` | Counter | `status` (success/error/skipped) |
+| `crypto_ai_batch_size` | Histogram | — |
+| `crypto_window_processing_duration_ms` | Histogram | `window_size` |
+| `crypto_websocket_reconnections_total` | Counter | `symbol` |
+| `crypto_redis_window_ops_total` | Counter | `op` (hincrbyfloat/setnx/lua), `symbol` |
 
 ---
 
@@ -618,8 +643,9 @@ services:
 KAFKA_BROKERS=localhost:9092
 POSTGRES_URL=postgresql://bitcoin:bitcoin@localhost:5432/bitcoin
 REDIS_URL=redis://localhost:6379
-BINANCE_WS_URL=wss://stream.binance.com:9443/ws/btcusdt@trade
-COLLECTOR_MODE=live           # live | mock
+BINANCE_WS_URL=wss://stream.binance.com:9443/ws
+SYMBOLS=BTCUSDT                # comma-separated list of symbols to track
+COLLECTOR_MODE=live            # live | mock
 OPENAI_API_KEY=sk-...
 DETECTOR_MIN_SAMPLES=30
 DETECTOR_ZSCORE_THRESHOLD=2.5
@@ -647,7 +673,7 @@ Binance WebSocket
 CollectorStream       — Transform: parse and normalize raw trade JSON
     │
     ▼
-KafkaProducerStream   — Writable: produce to btc.raw-trades
+KafkaProducerStream   — Writable: produce to crypto.raw-trades
                         highWaterMark: 1000 messages
                         pause() when producer internal buffer > 80% capacity
                         resume() when buffer drains below 20%
@@ -663,7 +689,7 @@ consumer.on('message', async (message) => {
 })
 ```
 
-This ensures the consumer never accumulates a queue of unprocessed messages in memory — it processes one at a time and pulls the next only when ready. For the Aggregator (pure arithmetic), this adds no meaningful latency. For Storage (DB writes), it prevents write queue buildup.
+This ensures the consumer never accumulates a queue of unprocessed messages in memory — it processes one at a time and pulls the next only when ready. For the Aggregator (arithmetic + Redis I/O, typically < 1ms per HINCRBY), this adds negligible latency. For Storage (DB writes), it prevents write queue buildup.
 
 **AI Service batch buffer:** The 30-second batch window (ADR-06) naturally acts as backpressure for the AI API — anomalies accumulate in a bounded buffer and are flushed at a controlled rate regardless of detection bursts.
 
@@ -688,19 +714,20 @@ The non-functional requirement states "no events should be lost during normal op
 | Collector (WebSocket) | Connection drop | Exponential backoff with jitter reconnect (ADR-01) |
 | Collector (Kafka produce) | Broker unavailable | Retry 5x with exponential backoff + jitter; if all fail, buffer in memory up to 10k messages, then pause WebSocket |
 | Storage (DB write) | Transient error | Retry 3x with exponential backoff + jitter (base 1s, cap 4s); on final failure → DLQ |
-| Aggregator | Any processing error | Log + skip trade; window continues with remaining trades |
+| Aggregator | Redis transient error | Retry 3x with exponential backoff + jitter (base 50ms, cap 500ms); on final failure → log + skip trade; window continues with remaining trades |
+| Aggregator | Any other processing error | Log + skip trade; window continues with remaining trades |
 | Detector | Any processing error | Log + skip window; do not publish anomaly for that window |
 | AI Service | `429` rate limit | Retry with exponential backoff + jitter; respect `Retry-After` header if present |
 | AI Service | `500` / `503` transient | Retry up to 3x with exponential backoff + jitter (base 1s, cap 4s); increment circuit breaker counter |
 | AI Service | `403` forbidden | Do NOT retry — log as critical alert, disable AI calls until API key is resolved |
-| AI Service | `400` bad request | Do NOT retry — send payload to `btc.dlq` for manual inspection |
+| AI Service | `400` bad request | Do NOT retry — send payload to `crypto.dlq` for manual inspection |
 | AI Service | Timeout (> 30s) | Retry once; on second timeout skip insight and increment circuit breaker counter |
 | Any consumer | Unhandled exception | Log error, do NOT commit offset → Kafka redelivers the message |
 
-**Dead Letter Queue:** `btc.dlq` topic receives messages that exhausted all retries. Each DLQ message includes:
+**Dead Letter Queue:** `crypto.dlq` topic receives messages that exhausted all retries. Each DLQ message includes:
 ```json
 {
-  "originalTopic": "btc.raw-trades",
+  "originalTopic": "crypto.raw-trades",
   "originalPayload": "...",
   "errorMessage": "...",
   "failedAt": "2024-01-01T00:00:00Z",
@@ -756,7 +783,7 @@ Server emits events as they occur:
 
   id: 1742
   event: anomaly
-  data: {"type":"PriceShock","symbol":"BTCUSDT","zScore":3.1,"detectedAt":"..."}
+  data: {"type":"PriceShock","symbol":"BTCUSDT","zScore":3.1,"detectedAt":"...","exchange":"binance"}
 
   id: 1743
   event: insight
@@ -770,7 +797,7 @@ Reconnect with resume:
   Server resumes from id: 1743 — no events missed
 ```
 
-Event IDs are monotonically increasing integers stored in Redis (`INCR btc:event:seq`), shared across all server instances. On reconnect, the server queries the DB for events after `Last-Event-ID` to replay missed events.
+Event IDs are monotonically increasing integers stored in Redis (`INCR crypto:event:seq`), shared across all server instances. On reconnect, the server queries the DB for events after `Last-Event-ID` to replay missed events.
 
 **Framework:** Fastify with `@fastify/reply-from` for streaming responses. SSE requires no additional plugin — it is a standard HTTP response with `Transfer-Encoding: chunked`.
 

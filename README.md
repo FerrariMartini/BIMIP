@@ -1,21 +1,21 @@
-# Bitcoin Market Intelligence Platform
+# Crypto Market Intelligence Platform
 
 ## Overview
 
-Bitcoin Market Intelligence Platform is a real-time event processing system designed to ingest live Bitcoin trading activity, detect market anomalies, identify trend changes, and generate AI-powered market insights.
+Crypto Market Intelligence Platform is a real-time event processing system designed to ingest live cryptocurrency trading activity, detect market anomalies, identify trend changes, and generate AI-powered market insights.
 
-The platform continuously processes public Bitcoin market events and transforms raw trade data into actionable information for traders, analysts, and researchers.
+The platform supports multiple symbols simultaneously (e.g., BTCUSDT, ETHUSDT, SOLUSDT) and continuously processes public market events, transforming raw trade data into actionable information for traders, analysts, and researchers.
 
-Rather than attempting to predict the future price of Bitcoin directly, the platform focuses on identifying relevant market signals and providing contextual explanations that support trading decisions.
+Rather than attempting to predict the future price of assets directly, the platform focuses on identifying relevant market signals and providing contextual explanations that support trading decisions.
 
 ---
 
 # Business Goal
 
-Build a real-time Bitcoin Market Intelligence Platform capable of:
+Build a real-time Crypto Market Intelligence Platform capable of:
 
-* Ingesting live Bitcoin trading events.
-* Detecting abnormal market behavior.
+* Ingesting live cryptocurrency trading events for multiple symbols.
+* Detecting abnormal market behavior per symbol.
 * Identifying trend changes.
 * Generating AI-powered market insights.
 * Providing historical analysis of detected events.
@@ -28,7 +28,7 @@ The platform should operate continuously, processing events as they arrive and t
 
 ## Trade Ingestion
 
-The system must consume real-time Bitcoin trade events from a public market data provider.
+The system must consume real-time cryptocurrency trade events from public market data providers for one or more configured symbols.
 
 Each event should contain information such as:
 
@@ -206,7 +206,7 @@ All architectural decisions are documented in [ARCHITECTURE.md](ARCHITECTURE.md)
 
 ```text
                         Binance WebSocket
-                       (btcusdt@trade stream)
+                  (btcusdt@trade, ethusdt@trade ...)
                                │
                                ▼
                     ┌─────────────────────┐
@@ -214,10 +214,10 @@ All architectural decisions are documented in [ARCHITECTURE.md](ARCHITECTURE.md)
                     │  Exponential Backoff │  Dual heartbeat (30s)
                     │  Mock mode for tests │
                     └──────────┬──────────┘
-                               │  partition key = symbol
+                               │  round-robin (no partition key)
                                ▼
                     ╔══════════════════════╗
-                    ║   btc.raw-trades     ║  Kafka (3 partitions, 7d retention)
+                    ║  crypto.raw-trades   ║  Kafka (6 partitions, 7d retention)
                     ╚═══════╤══════════════╝
                             │
             ┌───────────────┼───────────────┐
@@ -225,15 +225,17 @@ All architectural decisions are documented in [ARCHITECTURE.md](ARCHITECTURE.md)
             ▼               ▼               │
   ┌──────────────┐  ┌──────────────┐        │
   │  Aggregator  │  │   Storage    │        │
-  │  In-memory   │  │  TimescaleDB │        │
-  │  accumulators│  │  (trades)    │        │
-  └──────┬───────┘  └──────────────┘        │
+  │  Redis HASH  │  │  TimescaleDB │        │
+  │  HINCRBYFLOAT│  │  (trades)    │        │
+  │  SET NX lock │  └──────────────┘        │
+  └──────┬───────┘                          │
          │                                  │
          │  tumbling windows (1m, 5m, 15m)  │
+         │  window close via SET NX lock    │
          ▼                                  │
-╔═══════════════════════╗                   │
-║   btc.market-windows  ║  Kafka (1d)       │
-╚══════════╤════════════╝                   │
+╔══════════════════════════╗                │
+║  crypto.market-windows   ║  Kafka (1d)    │
+╚══════════╤═══════════════╝                │
            │                                │
      ┌─────┴────────┐                       │
      │              │                       │
@@ -246,9 +248,9 @@ All architectural decisions are documented in [ARCHITECTURE.md](ARCHITECTURE.md)
 └────┬─────┘                                │
      │  Z > 2.5 → anomaly event             │
      ▼                                      │
-╔══════════════╗                            │
-║ btc.anomalies║  Kafka (30d)               │
-╚══════╤═══════╝                            │
+╔═══════════════════╗                       │
+║  crypto.anomalies ║  Kafka (30d)          │
+╚══════╤════════════╝                       │
        │                                    │
   ┌────┴──────────┐                         │
   │               │                         │
@@ -261,9 +263,9 @@ All architectural decisions are documented in [ARCHITECTURE.md](ARCHITECTURE.md)
 └────┬─────┘
      │
      ▼
-╔══════════════╗
-║ btc.insights ║  Kafka (30d)
-╚══════╤═══════╝
+╔══════════════════╗
+║  crypto.insights ║  Kafka (30d)
+╚══════╤═══════════╝
        │
   ┌────┴──────────┐
   │               │
@@ -287,22 +289,22 @@ All architectural decisions are documented in [ARCHITECTURE.md](ARCHITECTURE.md)
 
 | Module | Reads from | Writes to | State |
 |---|---|---|---|
-| Collector | Binance WebSocket | `btc.raw-trades` | None |
-| Aggregator | `btc.raw-trades` | `btc.market-windows` | In-memory accumulators |
-| Detector | `btc.market-windows` | `btc.anomalies` | Redis (60-window baseline) |
-| AI Service | `btc.anomalies` | `btc.insights` | In-memory 30s batch buffer |
+| Collector | Binance WebSocket | `crypto.raw-trades` | None |
+| Aggregator | `crypto.raw-trades` | `crypto.market-windows` | Redis (HASH per symbol+window) |
+| Detector | `crypto.market-windows` | `crypto.anomalies` | Redis (60-window baseline) |
+| AI Service | `crypto.anomalies` | `crypto.insights` | In-memory 30s batch buffer |
 | Storage | All 4 topics | TimescaleDB | None |
 | API | TimescaleDB + event bus | REST/SSE clients | None |
 
 ## Kafka Topics
 
-| Topic | Producer | Consumers | Retention |
-|---|---|---|---|
-| `btc.raw-trades` | Collector | Aggregator, Storage | 7 days |
-| `btc.market-windows` | Aggregator | Detector, Storage | 1 day |
-| `btc.anomalies` | Detector | AI Service, Storage | 30 days |
-| `btc.insights` | AI Service | Storage | 30 days |
-| `btc.dlq` | Any (on failure) | Manual inspection | 7 days |
+| Topic | Producer | Consumers | Partitions | Retention |
+|---|---|---|---|---|
+| `crypto.raw-trades` | Collector | Aggregator, Storage | 6 | 7 days |
+| `crypto.market-windows` | Aggregator | Detector, Storage | 6 | 1 day |
+| `crypto.anomalies` | Detector | AI Service, Storage | 6 | 30 days |
+| `crypto.insights` | AI Service | Storage | 6 | 30 days |
+| `crypto.dlq` | Any (on failure) | Manual inspection | 1 | 7 days |
 
 ---
 
@@ -313,7 +315,7 @@ All architectural decisions are documented in [ARCHITECTURE.md](ARCHITECTURE.md)
 | Runtime | Node.js (TypeScript) | Event-driven I/O, Streams API, learning goal |
 | Message broker | Apache Kafka (KRaft) | Durable event log, consumer groups, replay |
 | Database | PostgreSQL + TimescaleDB | SQL + native time-series, hypertables |
-| Detector state | Redis | Atomic operations for rolling Z-score baseline |
+| Aggregator + Detector state | Redis | Atomic HINCRBYFLOAT for window accumulators; Z-score baseline; SET NX finalization lock |
 | AI | OpenAI GPT-4o-mini | Low cost (~$0.0001/insight), sufficient quality |
 | HTTP/WS server | Fastify | Low overhead, built-in schema validation |
 | Logging | Pino | Structured JSON, lowest Node.js overhead |
@@ -397,7 +399,7 @@ COLLECTOR_MODE=live npm run dev
 |---|---|---|
 | Kafka UI | http://localhost:8080 | Inspect topics, consumer lag, messages |
 | TimescaleDB | localhost:5432 | PostgreSQL + time-series extension |
-| Redis | localhost:6379 | Detector baseline state |
+| Redis | localhost:6379 | Aggregator window state + Detector baseline |
 | API | http://localhost:3000 | REST endpoints + SSE (`/api/v1/events`) |
 | Metrics | http://localhost:3000/metrics | Prometheus scrape |
 | Health | http://localhost:3000/health | System health check |
@@ -408,7 +410,8 @@ COLLECTOR_MODE=live npm run dev
 KAFKA_BROKERS=localhost:9092
 POSTGRES_URL=postgresql://bitcoin:bitcoin@localhost:5432/bitcoin
 REDIS_URL=redis://localhost:6379
-BINANCE_WS_URL=wss://stream.binance.com:9443/ws/btcusdt@trade
+BINANCE_WS_URL=wss://stream.binance.com:9443/ws              # base URL; symbols appended per stream
+SYMBOLS=BTCUSDT                      # comma-separated list of symbols to track (e.g. BTCUSDT,ETHUSDT)
 COLLECTOR_MODE=live                  # live | mock
 OPENAI_API_KEY=sk-...
 DETECTOR_MIN_SAMPLES=30              # windows before Z-score activates
@@ -425,7 +428,7 @@ This project demonstrates hands-on knowledge of:
 
 * **Node.js Streams** — backpressure, `Readable`/`Transform`/`Writable` pipeline
 * **Event-Driven Architecture** — decoupled modules communicating via events
-* **Apache Kafka** — topics, consumer groups, partition keys, offset management, DLQ
+* **Apache Kafka** — topics, consumer groups, round-robin partitioning, offset management, DLQ
 * **Streaming Data Processing** — tumbling windows, stateful aggregation
 * **Time-Series Data** — TimescaleDB hypertables, `time_bucket()` queries
 * **Backpressure** — `pause()`/`resume()` per-message consumer control
@@ -439,13 +442,9 @@ This project demonstrates hands-on knowledge of:
 
 # Future Enhancements
 
-## Aggregator Horizontal Scaling
-
-Replace in-memory window accumulators with Redis shared state (`HINCRBYFLOAT`). Multiple Aggregator instances can then process different partitions safely, enabling horizontal scaling without changing the detection or storage modules.
-
 ## Multi-Exchange Support
 
-Add exchange adapters for Coinbase, Kraken, and Bybit. Each exchange maps to a partition key — the Kafka topology already supports this with 3 partitions in `btc.raw-trades`.
+Add exchange adapters for Coinbase, Kraken, and Bybit. Each adapter connects to the exchange WebSocket and produces to the same `crypto.raw-trades` topic with the `exchange` field set in the payload. No changes are required to the Aggregator, Detector, Storage, or AI modules — they already operate per-symbol using the `symbol` field from each message.
 
 ## Observability Dashboard
 
