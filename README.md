@@ -329,9 +329,12 @@ All architectural decisions are documented in [ARCHITECTURE.md](ARCHITECTURE.md)
 ```
 bitcoin/
 ├── src/
-│   ├── collector/           — WebSocket ingestion, Kafka producer
-│   │   ├── binance/         — live Binance WebSocket client
-│   │   ├── mock/            — mock/replay mode (COLLECTOR_MODE=mock)
+│   ├── collector/           — trade ingestion, Kafka producer
+│   │   ├── providers/       — provider registry + implementations
+│   │   │   ├── binance/     — live Binance WebSocket client
+│   │   │   ├── mock/        — synthetic trades (COLLECTOR_MODE=mock)
+│   │   │   └── shared/      — reconnect utilities (backoff)
+│   │   ├── streams/         — Kafka producer stream
 │   │   └── index.ts
 │   ├── aggregator/          — tumbling window state, window events
 │   │   └── index.ts
@@ -410,9 +413,11 @@ COLLECTOR_MODE=live npm run dev
 KAFKA_BROKERS=localhost:9092
 POSTGRES_URL=postgresql://bitcoin:bitcoin@localhost:5432/bitcoin
 REDIS_URL=redis://localhost:6379
-BINANCE_WS_URL=wss://stream.binance.com:9443/ws              # base URL; symbols appended per stream
+BINANCE_WS_URL=wss://stream.binance.com:9443              # read by providers/binance when live
 SYMBOLS=BTCUSDT                      # comma-separated list of symbols to track (e.g. BTCUSDT,ETHUSDT)
 COLLECTOR_MODE=live                  # live | mock
+TRADE_PROVIDER=binance               # live mode only: binance (default)
+MOCK_TRADE_INTERVAL_MS=1000          # read by providers/mock when COLLECTOR_MODE=mock
 OPENAI_API_KEY=sk-...
 DETECTOR_MIN_SAMPLES=30              # windows before Z-score activates
 DETECTOR_ZSCORE_THRESHOLD=2.5        # standard deviations for anomaly

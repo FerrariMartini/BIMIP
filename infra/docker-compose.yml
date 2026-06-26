@@ -80,6 +80,10 @@ services:
     environment:
       NODE_ENV: development
       HOST: 0.0.0.0
+      COLLECTOR_MODE: mock
+      SYMBOLS: BTCUSDT
+      MOCK_TRADE_INTERVAL_MS: 1000
+      BINANCE_WS_URL: wss://stream.binance.com:9443
       KAFKA_BROKERS: kafka:9092
       POSTGRES_URL: postgresql://cmip:cmip@timescaledb:5432/cmip
       REDIS_URL: redis://redis:6379
