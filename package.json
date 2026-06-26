@@ -28,11 +28,14 @@
     "docker:logs": "docker compose -f infra/docker-compose.yml logs -f app"
   },
   "dependencies": {
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "kafkajs": "^2.2.4",
+    "ws": "^8.21.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/node": "^26.0.1",
+    "@types/ws": "^8.18.1",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3"
   }
