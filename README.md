@@ -462,9 +462,3 @@ Use RAG with historical anomaly patterns to generate richer, context-aware expla
 ## ML Anomaly Detection
 
 The `anomalies` table stores full window features (Z-scores, raw values, baseline stats) at detection time. This labeled dataset enables training a supervised ML model to replace or complement the rule-based Z-score detector.
-
----
-
-# Learning Goals
-
-The primary goal of this project is to gain hands-on experience building a production-style streaming platform: real-time event ingestion with backpressure, stateful windowed aggregation, statistical anomaly detection, and AI-powered market analysis — all connected through an event-driven Kafka backbone.
