@@ -66,7 +66,44 @@ services:
       kafka:
         condition: service_healthy
 
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile.dev
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+    container_name: cmip-app
+    user: "${UID:-1000}:${GID:-1000}"
+    env_file:
+      - ../.env
+    environment:
+      NODE_ENV: development
+      HOST: 0.0.0.0
+      KAFKA_BROKERS: kafka:9092
+      POSTGRES_URL: postgresql://cmip:cmip@timescaledb:5432/cmip
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "3000:3000"
+      - "9230:9229"
+    volumes:
+      - ../src:/app/src
+      - ../tsconfig.json:/app/tsconfig.json
+      - /app/node_modules
+    depends_on:
+      kafka:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   timescale_data:
   redis_data:
   kafka_data:
+
+networks:
+  default:
+    name: cmip-network

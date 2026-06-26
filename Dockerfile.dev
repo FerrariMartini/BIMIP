@@ -1,0 +1,16 @@
+ARG UID=1000
+ARG GID=1000
+
+FROM node:24-alpine
+
+RUN addgroup -g ${GID} appgroup 2>/dev/null || true \
+ && adduser -u ${UID} -G appgroup -s /bin/sh -D appuser 2>/dev/null || true
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+
+USER appuser
+
+CMD ["npx", "tsx", "watch", "src/main.ts"]
